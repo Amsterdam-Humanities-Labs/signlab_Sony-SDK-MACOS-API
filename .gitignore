@@ -1,0 +1,9 @@
+*.zip
+build/
+*.xcodeproj/
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+fx30_preset.json
+.DS_Store
