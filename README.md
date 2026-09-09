@@ -1,6 +1,116 @@
 # Sony Camera Remote SDK - macOS Web API
 
-Multi-camera web controller for Sony FX30 (and compatible) cameras over USB. Provides a REST API and embedded HTML dashboard for recording control, property monitoring, file download, and settings presets.
+Multi-camera web controller for Sony FX30 (and compatible) cameras over USB:
+one binary that discovers every attached camera, then exposes a REST API and an
+embedded HTML dashboard for starting and stopping them all at once.
+
+## What it does
+
+Recording a multi-camera take by hand means pressing record on each body and
+hoping the offsets are small. `fx30MultiRecord` replaces that with a single
+HTTP call. It links against the **Sony Camera Remote SDK (CRSDK)**, enumerates
+the FX30 bodies connected over USB, connects to each in Remote control mode,
+and serves:
+
+- a **REST API** — `POST /api/start` and `/api/stop` fan out to every camera;
+  `GET /api/status` returns each camera's connection state plus live properties
+  (ISO, shutter, aperture, white balance and colour temperature, movie format
+  and frame rate, recording state, battery, media time remaining per slot, and
+  the camera's overheat state);
+- an **embedded dashboard** — a single self-contained HTML page served from `/`,
+  no build step and no assets to deploy;
+- **file download** — pulls recorded clips off the cameras' cards over the SDK's
+  Contents Transfer mode into a local directory;
+- **settings presets** — capture the current settings of a camera to a JSON file
+  and push them back to every camera, so a multi-body rig can be brought into
+  agreement in one action;
+- **recovery** — `POST /api/scan` re-enumerates, and `POST /api/reset` performs a
+  macOS IOKit USB re-enumeration on the FX30 vendor/product ID first, which
+  clears the "camera stopped answering" state without unplugging cables.
+
+The repository also carries Sony's own `RemoteCli` sample application (`app/`)
+and a set of focused CLI samples (`simpleCli/app/`) — connection, live view,
+FTP transfer, lens information, property get/set — kept as working references
+for the SDK calls the controller uses.
+
+## Supported hardware
+
+- **Sony FX30**, connected over **USB** — what the controller filters for
+  (`isFX30Camera()` matches the model string) and the only body this has been
+  used with.
+- Other cameras supported by the Camera Remote SDK will connect through the
+  bundled samples, but the multi-camera controller's discovery and USB-reset
+  paths are FX30-specific (product ID `0x0e10`).
+- Multiple bodies at once: each discovered camera gets its own connection and
+  callback handler; commands are issued to all of them.
+
+## Where it runs
+
+**macOS** — a workstation with the cameras plugged into it over USB. This is a
+native macOS build: the USB reset path uses IOKit/CoreFoundation, the CRSDK
+binaries in `external/crsdk/` are `.dylib`s, and `CMAKE_OSX_DEPLOYMENT_TARGET`
+is 12.1. It is a local, LAN-facing tool — it binds an HTTP port on the machine
+the cameras are attached to, and is not a server-side or web-hosted service.
+
+The CRSDK itself is cross-platform and the sample apps build on Linux and
+Windows (see [Install required libraries and tools](#install-required-libraries-and-tools));
+only the prebuilt binaries shipped here and the USB-reset code are macOS-only.
+
+## Status
+
+**Experimental.** In active use for multi-camera recording sessions, but there
+is no test suite, no packaging and no service supervision — you build it and run
+it from a terminal.
+
+## Build
+
+Requires Xcode (matching your macOS version), CMake ≥ 3.21.7 and the CRSDK
+binaries already present in `external/crsdk/` (they are committed here).
+
+```bash
+brew install cmake autoconf automake libtool
+cd simpleCli
+mkdir build && cd build
+cmake -GXcode ..
+cmake --build . --config Release --target fx30MultiRecord
+```
+
+Full multi-platform build instructions for the SDK samples are further down under
+[Build from pre-built CRSDK binary files](#build-from-pre-built-crsdk-binary-files).
+
+## Configuration
+
+There is no configuration file and there are no credentials — everything is a
+command-line flag (see [CLI Arguments](#cli-arguments)). The one piece of state
+that lives outside the repo is the settings preset written by
+`POST /api/preset/save`, `fx30_preset.json` by default; it is gitignored, is
+specific to your rig, and is what `POST /api/preset/apply` reads back.
+
+The HTTP server has **no authentication**. Bind it only on a trusted network, or
+put it behind something that does authenticate.
+
+## Dependencies
+
+- **Sony Camera Remote SDK (CRSDK)** — headers in `app/CRSDK/`, prebuilt macOS
+  dylibs in `external/crsdk/`. Sony's own reference PDFs
+  (`Camera_Remote_SDK_Readme_v2.01.00.pdf`, `RemoteSampleApp_IM_v2.01.00.pdf`)
+  ship alongside.
+- **cpp-httplib** — vendored as `simpleCli/app/httplib.h`; provides the HTTP
+  server.
+- **OpenCV** — in `external/opencv/`, used by the live-view samples, not by the
+  multi-camera controller.
+- **macOS frameworks** — IOKit and CoreFoundation, for the USB reset.
+- Sony's SDK and the bundled OSS libraries carry their own licences; the notices
+  are reproduced at the end of this file.
+
+## Repository layout
+
+```
+app/          Sony's RemoteCli sample application + CRSDK public headers
+simpleCli/    Focused SDK samples, and app/fx30MultiRecord.cpp — the controller
+external/     Prebuilt CRSDK dylibs and OpenCV
+cmake/        Source/header enumeration helpers used by CMakeLists.txt
+```
 
 ## Web Controller (`fx30MultiRecord`)
 
