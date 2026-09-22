@@ -1,86 +1,12 @@
-# Build from pre-built CRSDK binary files
+# Third-party notices
 
-This package should have the following structure.
+The Sony Camera Remote SDK (CRSDK) in `simpleCli/app/CRSDK/` and `simpleCli/external/crsdk/`, and the two PDFs in the repo root, are Sony's and fall under Sony's Camera Remote SDK licence agreement (linked from https://www.sony.net/CameraRemoteSDK/).
 
-## Directory structure
-```
-.
-├── app
-│   ├── <App source files>
-│   └── CRSDK
-│       └── <Public headers>
-├── external
-│   └── crsdk
-│       ├── CrAdapter
-│       │   ├── Cr_PTP_IP binary
-│       │   ├── Cr_PTP_USB binary
-│       │   ├── libssh2 binary
-│       │   └── libusb-1.0 binary
-│       ├── Cr_Core binary
-│       ├── monitor_protocol binary
-│       └── monitor_protocol_pf binary
-├── CMakeLists.txt
-├── CMakePresets.json
-└── README.md
-```
+`simpleCli/external/crsdk/CrAdapter/libusb-1.0.0.dylib` is libusb, licensed under the GNU LGPL 2.1 (https://github.com/libusb/libusb/blob/master/COPYING).
 
-## Install required libraries and tools
-Supporting OS version: See CrSDK_API_Reference_xxx.zip.
+The notices below are reproduced from Sony's SDK readme.
 
-### Linux
-```
-sudo apt install autoconf libtool libudev-dev gcc g++ make cmake unzip libxml2-dev
-```
-
-### Windows
-Install the following:
-* Visual Studio 2022
-* Windows SDK 10.0.17763.0 or later
-* CMake 3.21.7 or later
-
-### Mac
-* Xcode according to OS version
-* Packages:
-```
-brew install cmake autoconf automake libtool
-```
-
-## Generate build files and build using CMake
-__Note1: The generated build files cannot be moved from the directory
-they are generated in due to CMake using absolute paths.
-Generate the build files in the directory you wish to build from.
-Check the CMake documentation to see how to specify a different build directory__
-
-__Note2: The build result can be moved without issue__
-
-### Configure (run once per OS)
-
-Linux:
-```
-cmake --preset Linux
-```
-
-Windows:
-```
-cmake --preset Win
-```
-
-Mac:
-```
-cmake --preset Mac
-```
-
-### Build (common)
-```
-cmake --build --preset auto
-```
-
-### Example: configure and build on Linux
-```
-cmake --preset Linux && cmake --build --preset auto
-```
-
-## copyright notice and disclaimer for OSS
+## Copyright notice and disclaimer for OSS
 ### libssh2
 
 Copyright (c) 2004-2007 Sara Golemon <sarag@libssh2.org>
