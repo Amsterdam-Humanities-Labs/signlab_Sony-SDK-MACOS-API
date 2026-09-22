@@ -14,7 +14,8 @@
 ## Where it runs
 
 - macOS 12.1+ (IOKit/CoreFoundation, prebuilt `.dylib`s), on the DRS machine the cameras are plugged into.
-- Binds a local HTTP port (default 8080). It is a LAN tool, not a hosted service.
+- Binds `0.0.0.0:<port>` (default 8080). **LAN/tailnet only**: no authentication, never expose it to the internet.
+- Its one remote caller is signlab_studio_beta's `fx30proxy.php` over Tailscale; access control belongs in that proxy.
 
 ## Status
 
@@ -41,7 +42,7 @@ Open `http://localhost:8080`.
 | `--download-path` | `/tmp/fx30_downloads` | Where downloads go |
 | `--preset` | `fx30_preset.json` | Settings preset file (gitignored, rig-specific) |
 
-No config file, no credentials. The HTTP server has **no authentication**: bind it only on a trusted network.
+No config file, no credentials, no authentication: anyone who can reach the port can record, format media or change the download path.
 
 ## REST API
 
