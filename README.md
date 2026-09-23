@@ -9,7 +9,7 @@
 - Dashboard: a self-contained HTML page served at `/`.
 - Downloads clips in Contents Transfer mode. Saves settings presets as JSON and applies them to all cameras.
 - Recovery: `POST /api/scan` scans again. `POST /api/reset` first resets the USB devices through IOKit.
-- `simpleCli/app/` also holds Sony's CLI samples (connection, live view, FTP, lens info, properties) as SDK examples.
+- `simpleCli/app/` also holds Sony's CLI samples (connection, live view, FTP, lens info, properties) as SDK examples. `CMakeLists.txt` builds each of them as its own target.
 
 ## Where it runs
 
@@ -70,4 +70,4 @@ Notes on SDK calls: [docs/sdk-patterns.md](docs/sdk-patterns.md).
 
 ## Licence
 
-The bundled Sony SDK (headers, dylibs and PDFs) belongs to Sony. Sony's Camera Remote SDK licence applies to it, not this repo's licence. Notices for the open-source components (libssh2, OpenSSL, OpenCV, libusbK, libusb, cpp-httplib) are in [NOTICE.md](NOTICE.md).
+The bundled Sony SDK (headers, dylibs and PDFs) belongs to Sony. Sony's Camera Remote SDK licence applies to it, not this repo's licence. [NOTICE.md](NOTICE.md) has the licence notices for libusb and cpp-httplib, and the notices copied from Sony's SDK readme (libssh2, OpenSSL, OpenCV, libusbK).
