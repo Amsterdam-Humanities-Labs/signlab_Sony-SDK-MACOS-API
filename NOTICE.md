@@ -1,10 +1,10 @@
 # Third-party notices
 
-The Sony Camera Remote SDK (CRSDK) in `simpleCli/app/CRSDK/` and `simpleCli/external/crsdk/`, and the two PDFs in the repo root, are Sony's and fall under Sony's Camera Remote SDK licence agreement (linked from https://www.sony.net/CameraRemoteSDK/).
+Sony owns the Sony Camera Remote SDK (CRSDK) in `simpleCli/app/CRSDK/` and `simpleCli/external/crsdk/`, and the two PDFs in the repo root. Sony's Camera Remote SDK licence agreement applies to them (linked from https://www.sony.net/CameraRemoteSDK/).
 
-`simpleCli/external/crsdk/CrAdapter/libusb-1.0.0.dylib` is libusb, licensed under the GNU LGPL 2.1 (https://github.com/libusb/libusb/blob/master/COPYING).
+`simpleCli/external/crsdk/CrAdapter/libusb-1.0.0.dylib` is libusb. Its licence is the GNU LGPL 2.1 (https://github.com/libusb/libusb/blob/master/COPYING).
 
-The notices below are reproduced from Sony's SDK readme.
+The notices below are copied from Sony's SDK readme.
 
 ## Copyright notice and disclaimer for OSS
 ### libssh2
