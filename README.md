@@ -15,7 +15,7 @@
 
 - macOS 12.1 or later (IOKit, CoreFoundation and prebuilt `.dylib` files), on DRS, the studio Mac the cameras are plugged into.
 - Listens on `0.0.0.0:<port>` (default 8080). There is no authentication, so keep it on the LAN or tailnet. Never expose it to the internet.
-- Its only remote caller is `fx30proxy.php` in signlab_studio_beta, over Tailscale. Access control belongs in that proxy.
+- Its only remote caller is `fx30proxy.php` in signlab_camera-control, over Tailscale. Access control belongs in that proxy.
 
 ## Status
 
