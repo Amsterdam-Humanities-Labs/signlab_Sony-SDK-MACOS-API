@@ -8,12 +8,14 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -311,6 +313,9 @@ static std::string crStr16ToString(const CrInt16u* str)
     return out;
 }
 
+// Persistent per-day event log (connect/disconnect/scan); defined later.
+static void logEvent(const std::string& msg);
+
 struct CameraProperties {
     int battery = -1;
     std::string iso = "---";
@@ -501,10 +506,13 @@ public:
             }
 
             CrCout << "  Connected: " << m_modelId << "\n";
+            logEvent("CONNECTED " + std::string(m_modelId.begin(), m_modelId.end()));
             return true;
         }
 
         CrCout << "  Failed to connect " << m_modelId << " after " << maxRetries << " attempts.\n";
+        logEvent("CONNECT_FAILED " + std::string(m_modelId.begin(), m_modelId.end())
+                 + " (after " + std::to_string(maxRetries) + " attempts)");
         return false;
     }
 
@@ -707,6 +715,9 @@ static std::atomic<bool> g_scanning{false};
 static std::string g_scanStatus;
 static std::atomic<bool> g_running{true};
 static std::string g_presetPath = "fx30_preset.json";
+static std::atomic<bool> g_listing{false};
+static std::string g_listStatus;
+static std::string g_filesJson = "null";
 
 // ---------------------------------------------------------------------------
 // Settings Preset (save/restore camera properties)
@@ -872,6 +883,7 @@ static void scanAndConnect(bool usbReset = false)
     if (err || !enumInfo) {
         std::cout << "No cameras found.\n";
         g_scanStatus = "No cameras found.";
+        logEvent("SCAN_ENUMERATED 0 FX30 on USB: (none)");
         g_scanning = false;
         return;
     }
@@ -883,6 +895,21 @@ static void scanAndConnect(bool usbReset = false)
     // First pass: count FX30 cameras
     for (uint32_t i = 0; i < count; i++) {
         if (isFX30Camera(enumInfo->GetCameraObjectInfo(i))) fx30Total++;
+    }
+
+    // Record every FX30 physically present on the USB bus this scan — this is
+    // what makes "was camera X powered on that day?" answerable after the fact.
+    {
+        std::string seen;
+        for (uint32_t i = 0; i < count; i++) {
+            auto* oi = enumInfo->GetCameraObjectInfo(i);
+            if (!isFX30Camera(oi)) continue;
+            CrString id = getModelId(oi);
+            if (!seen.empty()) seen += ", ";
+            seen += std::string(id.begin(), id.end());
+        }
+        logEvent("SCAN_ENUMERATED " + std::to_string(fx30Total) + " FX30 on USB: "
+                 + (seen.empty() ? "(none)" : seen));
     }
 
     uint32_t fx30Attempted = 0;
@@ -929,10 +956,14 @@ static void scanAndConnect(bool usbReset = false)
     if (fx30Found == 0) {
         std::cout << "No new FX30 cameras found.\n";
         g_scanStatus = "Scan complete. No new cameras found.";
+        logEvent("SCAN_RESULT newly_connected=0 total_connected="
+                 + std::to_string(g_cameras.size()));
     } else {
         std::cout << fx30Found << " FX30 camera(s) connected. Total: " << g_cameras.size() << "\n";
         g_scanStatus = "Scan complete. " + std::to_string(fx30Found) + " new camera(s), " +
             std::to_string(g_cameras.size()) + " total.";
+        logEvent("SCAN_RESULT newly_connected=" + std::to_string(fx30Found)
+                 + " total_connected=" + std::to_string(g_cameras.size()));
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
         // Apply preset if file exists
@@ -974,15 +1005,16 @@ static void cameraManagementThread()
 
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::seconds(5));
-        if (!g_running || g_downloading || g_scanning) { disconnectedSecs = 0; continue; }
+        if (!g_running || g_downloading || g_scanning || g_listing) { disconnectedSecs = 0; continue; }
 
         std::lock_guard<std::mutex> lock(g_mutex);
 
         // Clear reconnecting flags for cameras that recovered
         for (auto& cam : g_cameras) {
             if (cam->m_connected && cam->m_reconnecting) {
-                std::cout << "  Reconnected: "
-                          << std::string(cam->m_modelId.begin(), cam->m_modelId.end()) << "\n";
+                std::string name(cam->m_modelId.begin(), cam->m_modelId.end());
+                std::cout << "  Reconnected: " << name << "\n";
+                logEvent("RECONNECTED " + name);
                 cam->m_reconnecting = false;
             }
         }
@@ -1007,6 +1039,15 @@ static void cameraManagementThread()
         // Only do a full tear-down after sustained disconnection
         if (disconnectedSecs >= kResetAfterSecs) {
             std::cout << "Resetting after " << disconnectedSecs << "s disconnection...\n";
+            std::string lost;
+            for (auto& cam : g_cameras) {
+                if (!cam->m_connected) {
+                    if (!lost.empty()) lost += ", ";
+                    lost += std::string(cam->m_modelId.begin(), cam->m_modelId.end());
+                }
+            }
+            logEvent("DISCONNECTED after " + std::to_string(disconnectedSecs)
+                     + "s: " + (lost.empty() ? "(unknown)" : lost) + " — resetting");
             for (auto& cam : g_cameras) cam->disconnect();
             g_cameras.clear();
             scanAndConnect(true);
@@ -1022,6 +1063,7 @@ static void cameraManagementThread()
 static void downloadFilesThread()
 {
     g_downloading = true;
+    logEvent("DOWNLOAD started");
     std::string dlPath;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -1138,9 +1180,23 @@ static void downloadFilesThread()
                 totalFiles++;
                 std::string fileName(info.fileName);
 
-                // Skip if file already exists
+                // Skip if file already exists — either still in the download
+                // dir, or already sorted into the per-recording-date folder
+                // next to it (../YYYY-MM-DD/raw/<file>, the sync client moves
+                // clips there after each download).
                 std::string fullPath = dlPath + "/" + fileName;
-                if (fs::exists(fullPath)) {
+                bool alreadyHave = fs::exists(fullPath);
+                if (!alreadyHave && fileName.size() >= 14) {
+                    std::string d = fileName.substr(1, 8);
+                    if (d.find_first_not_of("0123456789") == std::string::npos) {
+                        std::string dateDir = d.substr(0, 4) + "-" + d.substr(4, 2)
+                                              + "-" + d.substr(6, 2);
+                        fs::path sorted = fs::path(dlPath).parent_path()
+                                          / dateDir / "raw" / fileName;
+                        alreadyHave = fs::exists(sorted);
+                    }
+                }
+                if (alreadyHave) {
                     skippedFiles++;
                     {
                         std::lock_guard<std::mutex> lock(g_mutex);
@@ -1217,7 +1273,331 @@ static void downloadFilesThread()
             ", Errors: " + std::to_string(errorFiles);
     }
 
+    logEvent("DOWNLOAD complete: downloaded=" + std::to_string(downloadedFiles)
+             + " skipped=" + std::to_string(skippedFiles)
+             + " errors=" + std::to_string(errorFiles));
     g_downloading = false;
+}
+
+// ---------------------------------------------------------------------------
+// List files on cameras (ContentsTransfer enumeration only, no download)
+// ---------------------------------------------------------------------------
+static void listFilesThread()
+{
+    g_listing = true;
+
+    // Step 1: Disconnect all cameras from Remote mode
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_listStatus = "Disconnecting cameras from Remote mode...";
+        for (auto& cam : g_cameras) cam->disconnect();
+        g_cameras.clear();
+    }
+
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    // Step 2: Enumerate and connect in ContentsTransfer mode
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_listStatus = "Scanning for cameras in ContentsTransfer mode...";
+    }
+
+    SCRSDK::ICrEnumCameraObjectInfo* enumInfo = nullptr;
+    SCRSDK::CrError err = SCRSDK::EnumCameraObjects(&enumInfo, 3);
+    if (err || !enumInfo) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_listStatus = "Error: No cameras found for listing.";
+        scanAndConnect(false);
+        g_listing = false;
+        return;
+    }
+
+    uint32_t camCount = enumInfo->GetCount();
+    std::vector<std::unique_ptr<CameraDevice>> listCameras;
+    for (uint32_t i = 0; i < camCount; i++) {
+        auto* objInfo = enumInfo->GetCameraObjectInfo(i);
+        if (!isFX30Camera(objInfo)) continue;
+        auto cam = std::make_unique<CameraDevice>();
+        if (cam->connectContentsTransfer(objInfo)) {
+            listCameras.push_back(std::move(cam));
+        }
+    }
+    enumInfo->Release();
+
+    if (listCameras.empty()) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_listStatus = "Error: Could not connect to any camera in ContentsTransfer mode.";
+        scanAndConnect(false);
+        g_listing = false;
+        return;
+    }
+
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+
+    // Step 3: Enumerate file names per camera
+    std::ostringstream js;
+    js << "{\"cameras\":{";
+    int total = 0;
+    int errorFiles = 0;
+    for (size_t ci = 0; ci < listCameras.size(); ci++) {
+        auto& cam = listCameras[ci];
+        std::string camName(cam->m_modelId.begin(), cam->m_modelId.end());
+        if (ci > 0) js << ",";
+        js << "\"" << jsonEscape(camName) << "\":[";
+
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_listStatus = "Listing files on " + camName + "...";
+        }
+
+        bool first = true;
+        SCRSDK::CrMtpFolderInfo* folderList = nullptr;
+        CrInt32u folderCount = 0;
+        err = SCRSDK::GetDateFolderList(cam->m_device_handle, &folderList, &folderCount);
+        if (!err && folderList && folderCount > 0) {
+            for (CrInt32u fi = 0; fi < folderCount; fi++) {
+                SCRSDK::CrContentHandle* contentHandles = nullptr;
+                CrInt32u contentCount = 0;
+                err = SCRSDK::GetContentsHandleList(cam->m_device_handle,
+                    folderList[fi].handle, &contentHandles, &contentCount);
+                if (err || !contentHandles || contentCount == 0) continue;
+
+                for (CrInt32u ci2 = 0; ci2 < contentCount; ci2++) {
+                    SCRSDK::CrMtpContentsInfo info;
+                    err = SCRSDK::GetContentsDetailInfo(cam->m_device_handle,
+                        contentHandles[ci2], &info);
+                    if (err) { errorFiles++; continue; }
+                    if (!first) js << ",";
+                    js << "\"" << jsonEscape(std::string(info.fileName)) << "\"";
+                    first = false;
+                    total++;
+                }
+                SCRSDK::ReleaseContentsHandleList(cam->m_device_handle, contentHandles);
+            }
+            SCRSDK::ReleaseDateFolderList(cam->m_device_handle, folderList);
+        }
+        js << "]";
+    }
+    js << "},\"total\":" << total << ",\"errors\":" << errorFiles << "}";
+
+    // Step 4: Disconnect and reconnect in Remote mode
+    for (auto& cam : listCameras) cam->disconnect();
+    listCameras.clear();
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_filesJson = js.str();
+        g_listStatus = "Listing complete. " + std::to_string(total) + " file(s) on " +
+            std::to_string(camCount) + " camera(s). Reconnecting...";
+        scanAndConnect(false);
+        g_listStatus = "Listing complete. " + std::to_string(total) + " file(s).";
+    }
+
+    g_listing = false;
+}
+
+// ---------------------------------------------------------------------------
+// Capture log: authoritative record of triggered captures (per date), written
+// at /api/start time so the clip names are exact. File format matches the
+// PyQt controller's capture_logs/{date}.json so both can read the same files.
+// ---------------------------------------------------------------------------
+static std::string g_captureLogDir = "capture_logs";
+
+struct CaptureEntry {
+    std::string time;                                        // ISO timestamp
+    std::vector<std::pair<std::string, std::string>> clips;  // serial -> file
+};
+
+static std::string localDateString()
+{
+    time_t t = time(nullptr);
+    struct tm lt;
+    localtime_r(&t, &lt);
+    char buf[16];
+    strftime(buf, sizeof(buf), "%Y-%m-%d", &lt);
+    return buf;
+}
+
+static std::string localTimeIso()
+{
+    time_t t = time(nullptr);
+    struct tm lt;
+    localtime_r(&t, &lt);
+    char buf[24];
+    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &lt);
+    return buf;
+}
+
+// Append a line to the persistent per-day event log. Survives restarts, so
+// "which cameras were up on day X?" is answerable after the fact. Lives next to
+// the capture logs (capture_logs/events-YYYY-MM-DD.log).
+static std::mutex g_eventLogMutex;
+static void logEvent(const std::string& msg)
+{
+    try { fs::create_directories(g_captureLogDir); } catch (...) {}
+    std::lock_guard<std::mutex> lk(g_eventLogMutex);
+    std::ofstream f(g_captureLogDir + "/events-" + localDateString() + ".log",
+                    std::ios::app);
+    if (f.good()) f << localTimeIso() << "  " << msg << "\n";
+}
+
+// Extract the JSON string that starts at the first '"' at/after pos.
+static std::string extractJsonString(const std::string& s, size_t& pos)
+{
+    pos = s.find('"', pos);
+    if (pos == std::string::npos) return "";
+    std::string out;
+    for (pos++; pos < s.size(); pos++) {
+        char c = s[pos];
+        if (c == '\\' && pos + 1 < s.size()) { out += s[++pos]; continue; }
+        if (c == '"') { pos++; break; }
+        out += c;
+    }
+    return out;
+}
+
+// Tolerant parser for our own / the Python app's capture log files.
+static std::vector<CaptureEntry> loadCaptures(const std::string& date)
+{
+    std::vector<CaptureEntry> entries;
+    std::ifstream f(g_captureLogDir + "/" + date + ".json");
+    if (!f.good()) return entries;
+    std::stringstream ss; ss << f.rdbuf();
+    std::string s = ss.str();
+
+    size_t pos = 0;
+    while ((pos = s.find("\"time\"", pos)) != std::string::npos) {
+        CaptureEntry e;
+        size_t p = pos + 6;
+        p = s.find(':', p); if (p == std::string::npos) break;
+        p++;
+        e.time = extractJsonString(s, p);
+        size_t clipsPos = s.find("\"clips\"", p);
+        if (clipsPos == std::string::npos) break;
+        size_t open = s.find('{', clipsPos);
+        if (open == std::string::npos) break;
+        size_t close = s.find('}', open);
+        if (close == std::string::npos) break;
+        size_t q = open + 1;
+        while (q < close) {
+            std::string serial = extractJsonString(s, q);
+            if (serial.empty() || q >= close) break;
+            q = s.find(':', q); if (q == std::string::npos || q >= close) break;
+            q++;
+            std::string file = extractJsonString(s, q);
+            if (!file.empty()) e.clips.push_back({serial, file});
+        }
+        if (!e.clips.empty()) entries.push_back(e);
+        pos = close;
+    }
+    return entries;
+}
+
+static void saveCaptures(const std::string& date,
+                         const std::vector<CaptureEntry>& entries)
+{
+    try { fs::create_directories(g_captureLogDir); } catch (...) {}
+    std::ofstream f(g_captureLogDir + "/" + date + ".json", std::ios::trunc);
+    f << "[";
+    for (size_t i = 0; i < entries.size(); i++) {
+        if (i) f << ",";
+        f << "\n  {\n    \"time\": \"" << jsonEscape(entries[i].time)
+          << "\",\n    \"clips\": {";
+        for (size_t j = 0; j < entries[i].clips.size(); j++) {
+            if (j) f << ",";
+            f << "\n      \"" << jsonEscape(entries[i].clips[j].first) << "\": \""
+              << jsonEscape(entries[i].clips[j].second) << "\"";
+        }
+        f << "\n    }\n  }";
+    }
+    f << "\n]";
+}
+
+static std::set<std::string> loadSynced(const std::string& date)
+{
+    std::set<std::string> out;
+    std::ifstream f(g_captureLogDir + "/" + date + ".synced.txt");
+    std::string line;
+    while (std::getline(f, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+            line.pop_back();
+        if (!line.empty()) out.insert(line);
+    }
+    return out;
+}
+
+static void saveSynced(const std::string& date, const std::set<std::string>& files)
+{
+    try { fs::create_directories(g_captureLogDir); } catch (...) {}
+    std::ofstream f(g_captureLogDir + "/" + date + ".synced.txt", std::ios::trunc);
+    for (const auto& x : files) f << x << "\n";
+}
+
+// Called from /api/start with the clip snapshot taken just before recording.
+static void appendCapture(const std::vector<std::pair<std::string, std::string>>& clips)
+{
+    if (clips.empty()) return;
+    std::string date = localDateString();
+    auto entries = loadCaptures(date);
+    if (!entries.empty() && entries.back().clips == clips) return;  // dedupe
+    CaptureEntry e;
+    e.time = localTimeIso();
+    e.clips = clips;
+    entries.push_back(e);
+    saveCaptures(date, entries);
+}
+
+// A clip counts as downloaded if it is in the download dir (staging inbox) or
+// already sorted into the per-date folder next to it.
+static bool clipDownloaded(const std::string& fileName)
+{
+    try {
+        if (fs::exists(fs::path(g_downloadPath) / fileName)) return true;
+        if (fileName.size() >= 14) {
+            std::string d = fileName.substr(1, 8);
+            if (d.find_first_not_of("0123456789") == std::string::npos) {
+                std::string dateDir = d.substr(0, 4) + "-" + d.substr(4, 2)
+                                      + "-" + d.substr(6, 2);
+                return fs::exists(fs::path(g_downloadPath).parent_path()
+                                  / dateDir / "raw" / fileName);
+            }
+        }
+    } catch (...) {}
+    return false;
+}
+
+static std::string buildCapturesJson(const std::string& date)
+{
+    auto entries = loadCaptures(date);
+    auto synced = loadSynced(date);
+    std::ostringstream js;
+    js << "{\"date\":\"" << jsonEscape(date) << "\",\"captures\":[";
+    for (size_t i = 0; i < entries.size(); i++) {
+        if (i) js << ",";
+        js << "{\"time\":\"" << jsonEscape(entries[i].time) << "\",\"clips\":{";
+        for (size_t j = 0; j < entries[i].clips.size(); j++) {
+            if (j) js << ",";
+            js << "\"" << jsonEscape(entries[i].clips[j].first) << "\":\""
+               << jsonEscape(entries[i].clips[j].second) << "\"";
+        }
+        js << "},\"synced\":{";
+        for (size_t j = 0; j < entries[i].clips.size(); j++) {
+            if (j) js << ",";
+            js << "\"" << jsonEscape(entries[i].clips[j].second) << "\":"
+               << (synced.count(entries[i].clips[j].second) ? "true" : "false");
+        }
+        js << "},\"downloaded\":{";
+        for (size_t j = 0; j < entries[i].clips.size(); j++) {
+            if (j) js << ",";
+            const std::string& fn = entries[i].clips[j].second;
+            bool dl = synced.count(fn) || clipDownloaded(fn);
+            js << "\"" << jsonEscape(fn) << "\":" << (dl ? "true" : "false");
+        }
+        js << "}}";
+    }
+    js << "]}";
+    return js.str();
 }
 
 // ---------------------------------------------------------------------------
@@ -1561,6 +1941,8 @@ static std::string buildStatusJson()
     js << "\"downloadPath\":\"" << jsonEscape(g_downloadPath) << "\",";
     js << "\"scanning\":" << (g_scanning.load() ? "true" : "false") << ",";
     js << "\"scanStatus\":\"" << jsonEscape(g_scanStatus) << "\",";
+    js << "\"listing\":" << (g_listing.load() ? "true" : "false") << ",";
+    js << "\"listStatus\":\"" << jsonEscape(g_listStatus) << "\",";
     js << "\"presetPath\":\"" << jsonEscape(g_presetPath) << "\",";
     js << "\"hasPreset\":" << (fs::exists(g_presetPath) ? "true" : "false");
     js << "}";
@@ -1601,6 +1983,8 @@ int main(int argc, char* argv[])
             g_downloadPath = argv[++i];
         } else if (arg == "--preset" && i + 1 < argc) {
             g_presetPath = argv[++i];
+        } else if (arg == "--capture-log-dir" && i + 1 < argc) {
+            g_captureLogDir = argv[++i];
         }
     }
 
@@ -1619,6 +2003,22 @@ int main(int argc, char* argv[])
     // Create HTTP server (starts immediately, doesn't wait for camera scan)
     httplib::Server svr;
 
+    // CORS: the web app is served from a different origin (e.g.
+    // https://signcollect.nl) so cross-origin requests to this local API must
+    // be allowed. Add the headers to every response, and answer the browser's
+    // OPTIONS preflight before it sends the real request.
+    svr.set_post_routing_handler([](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "Content-Type");
+    });
+    svr.Options(R"(.*)", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "Content-Type");
+        res.status = 204;
+    });
+
     // Serve embedded HTML frontend
     svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(HTML_PAGE, "text/html");
@@ -1631,22 +2031,96 @@ int main(int argc, char* argv[])
 
     // POST /api/start
     svr.Post("/api/start", [](const httplib::Request&, httplib::Response& res) {
-        if (g_downloading) {
-            res.set_content("{\"error\":\"Download in progress\"}", "application/json");
+        if (g_downloading || g_listing) {
+            res.set_content(g_downloading ? "{\"error\":\"Download in progress\"}"
+                                          : "{\"error\":\"Listing in progress\"}", "application/json");
             return;
         }
         std::lock_guard<std::mutex> lock(g_mutex);
         int ok = 0, fail = 0;
+        std::vector<std::pair<std::string, std::string>> clips;
         for (auto& cam : g_cameras) {
-            if (cam->startRecording()) ok++; else fail++;
+            // Snapshot the clip name BEFORE starting: it names the clip that
+            // this recording will create.
+            std::string clipName;
+            if (cam->m_connected) clipName = cam->getProperties().clipName;
+            if (cam->startRecording()) {
+                ok++;
+                if (!clipName.empty()) {
+                    std::string modelStr(cam->m_modelId.begin(), cam->m_modelId.end());
+                    std::string serial = modelStr;
+                    size_t o = modelStr.find('('), c = modelStr.find(')');
+                    if (o != std::string::npos && c != std::string::npos && c > o)
+                        serial = modelStr.substr(o + 1, c - o - 1);
+                    clips.push_back({serial, clipName + ".MP4"});
+                }
+            } else {
+                fail++;
+            }
+        }
+        // All-or-nothing: a multi-camera capture with a missing angle is
+        // useless. If any camera failed to start, stop the ones that did and
+        // report an aborted capture instead of logging it.
+        if (fail > 0 && ok > 0) {
+            for (auto& cam : g_cameras) {
+                if (cam->m_connected) cam->stopRecording();
+            }
+            res.set_content("{\"ok\":0,\"failed\":" + std::to_string(ok + fail) +
+                            ",\"aborted\":true,\"error\":\"" + std::to_string(fail) +
+                            " camera(s) failed to start; all cameras stopped\"}",
+                            "application/json");
+            return;
+        }
+        if (ok > 0) {
+            appendCapture(clips);
+            logEvent("CAPTURE started on " + std::to_string(ok) + " camera(s)");
         }
         res.set_content("{\"ok\":" + std::to_string(ok) + ",\"failed\":" + std::to_string(fail) + "}", "application/json");
     });
 
+    // GET /api/captures?date=YYYY-MM-DD - captures triggered that day (default
+    // today) with per-file synced status
+    svr.Get("/api/captures", [](const httplib::Request& req, httplib::Response& res) {
+        std::string date = req.get_param_value("date");
+        if (date.empty()) date = localDateString();
+        std::lock_guard<std::mutex> lock(g_mutex);
+        res.set_content(buildCapturesJson(date), "application/json");
+    });
+
+    // POST /api/captures/synced {"date":"YYYY-MM-DD","files":["X.MP4",...]}
+    // - reported by the sync client after verifying files on the drive
+    svr.Post("/api/captures/synced", [](const httplib::Request& req, httplib::Response& res) {
+        std::string date = jsonGetString(req.body, "date");
+        if (date.empty()) date = localDateString();
+        std::set<std::string> files;
+        size_t pos = req.body.find("\"files\"");
+        if (pos != std::string::npos) {
+            size_t open = req.body.find('[', pos);
+            size_t close = req.body.find(']', open);
+            if (open != std::string::npos && close != std::string::npos) {
+                size_t q = open + 1;
+                while (q < close) {
+                    std::string fname = extractJsonString(req.body, q);
+                    if (fname.empty() || q > close) break;
+                    files.insert(fname);
+                }
+            }
+        }
+        std::lock_guard<std::mutex> lock(g_mutex);
+        // merge with already-known synced files (a partial report must not
+        // un-sync files reported earlier)
+        auto existing = loadSynced(date);
+        files.insert(existing.begin(), existing.end());
+        saveSynced(date, files);
+        res.set_content("{\"date\":\"" + jsonEscape(date) + "\",\"synced\":" +
+                        std::to_string(files.size()) + "}", "application/json");
+    });
+
     // POST /api/stop
     svr.Post("/api/stop", [](const httplib::Request&, httplib::Response& res) {
-        if (g_downloading) {
-            res.set_content("{\"error\":\"Download in progress\"}", "application/json");
+        if (g_downloading || g_listing) {
+            res.set_content(g_downloading ? "{\"error\":\"Download in progress\"}"
+                                          : "{\"error\":\"Listing in progress\"}", "application/json");
             return;
         }
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -1659,8 +2133,9 @@ int main(int argc, char* argv[])
 
     // POST /api/scan
     svr.Post("/api/scan", [](const httplib::Request&, httplib::Response& res) {
-        if (g_downloading) {
-            res.set_content("{\"error\":\"Download in progress\"}", "application/json");
+        if (g_downloading || g_listing) {
+            res.set_content(g_downloading ? "{\"error\":\"Download in progress\"}"
+                                          : "{\"error\":\"Listing in progress\"}", "application/json");
             return;
         }
         if (g_scanning) {
@@ -1676,8 +2151,9 @@ int main(int argc, char* argv[])
 
     // POST /api/reset
     svr.Post("/api/reset", [](const httplib::Request&, httplib::Response& res) {
-        if (g_downloading) {
-            res.set_content("{\"error\":\"Download in progress\"}", "application/json");
+        if (g_downloading || g_listing) {
+            res.set_content(g_downloading ? "{\"error\":\"Download in progress\"}"
+                                          : "{\"error\":\"Listing in progress\"}", "application/json");
             return;
         }
         if (g_scanning) {
@@ -1695,7 +2171,7 @@ int main(int argc, char* argv[])
 
     // POST /api/format - quick format slot 1 on all cameras
     svr.Post("/api/format", [](const httplib::Request&, httplib::Response& res) {
-        if (g_downloading || g_scanning) {
+        if (g_downloading || g_scanning || g_listing) {
             res.set_content("{\"error\":\"Busy\"}", "application/json");
             return;
         }
@@ -1758,13 +2234,31 @@ int main(int argc, char* argv[])
     });
 
     // GET /api/files - list files on all cameras (mode-switch)
-    svr.Get("/api/files", [](const httplib::Request&, httplib::Response& res) {
-        if (g_downloading) {
-            res.set_content("{\"error\":\"Download in progress\"}", "application/json");
+    // POST /api/list-files - enumerate files on cameras without downloading
+    svr.Post("/api/list-files", [](const httplib::Request&, httplib::Response& res) {
+        if (g_downloading || g_scanning || g_listing) {
+            res.set_content("{\"error\":\"Busy\"}", "application/json");
             return;
         }
-        // For now, return a simple message - full listing requires mode switch
-        res.set_content("{\"message\":\"Use download to fetch files\"}", "application/json");
+        std::thread(listFilesThread).detach();
+        res.set_content("{\"status\":\"listing started\"}", "application/json");
+    });
+
+    // GET /api/files - result of the last /api/list-files run
+    svr.Get("/api/files", [](const httplib::Request&, httplib::Response& res) {
+        if (g_downloading || g_listing) {
+            res.set_content(g_downloading ? "{\"error\":\"Download in progress\"}"
+                                          : "{\"error\":\"Listing in progress\"}", "application/json");
+            return;
+        }
+        if (g_listing) {
+            res.set_content("{\"error\":\"Listing in progress\"}", "application/json");
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            res.set_content("{\"files\":" + g_filesJson + "}", "application/json");
+        }
     });
 
     // POST /api/download

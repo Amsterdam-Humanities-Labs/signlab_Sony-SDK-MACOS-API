@@ -1,0 +1,15 @@
+{
+  "api_url": "<api_url>",
+  "server_binary": "<server_binary>",
+  "server_port": 8080,
+  "studio_root": "<studio_root>",
+  "staging_dir": "<staging_dir>",
+  "rclone_binary": "<rclone_binary>",
+  "rclone_remote_root": "<rclone_remote_root>",
+  "download_subdir": "<download_subdir>",
+  "poll_interval_ms": 1500,
+  "expected_cameras": 5,
+  "studio_url": "<studio_url>",
+  "display_url": "<display_url>",
+  "display_screen": "<display_screen>"
+}
