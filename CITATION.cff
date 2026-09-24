@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "signlab_Sony-SDK-MACOS-API: Sony macos API for FX30 cameras"
+authors:
+  - given-names: Gomer
+    family-names: Otterspeer
+    affiliation: University of Amsterdam
+  - given-names: Berit
+    family-names: Janssen
+  - given-names: Stijn
+    name-particle: van
+    family-names: Hannen
+license: Apache-2.0
+repository-code: "https://github.com/Amsterdam-Humanities-Labs/signlab_Sony-SDK-MACOS-API"
+keywords:
+  - "sign language"
+  - "NGT"
+  - "SignCollect"
