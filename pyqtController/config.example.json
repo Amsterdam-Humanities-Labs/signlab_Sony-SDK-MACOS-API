@@ -11,5 +11,7 @@
   "expected_cameras": 5,
   "studio_url": "<studio_url>",
   "display_url": "<display_url>",
-  "display_screen": "<display_screen>"
+  "display_screen": "<display_screen>",
+  "drs_dir": "/Users/signlab/drs",
+  "health_command": ["/usr/bin/python3", "/Users/signlab/drs/tools/health.py", "--json"]
 }

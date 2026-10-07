@@ -10,20 +10,24 @@ import json
 import math
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
+import threading
 import urllib.error
 import urllib.request
 from datetime import date, datetime
 from pathlib import Path
 
-from PyQt6.QtCore import QPointF, QRect, QSize, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPen
+from PyQt6.QtCore import QPointF, QRect, QSize, Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import (
+    QColor, QDesktopServices, QFont, QFontDatabase, QFontMetrics, QIcon, QPainter, QPen, QPixmap,
+)
 from PyQt6.QtWidgets import (
     QApplication, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
     QLabel, QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
-    QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
+    QTableWidget, QTableWidgetItem, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 APP_DIR = Path(__file__).resolve().parent
@@ -692,6 +696,430 @@ class CameraCard(QFrame):
         self.setStyleSheet("background-color: #eeeeee;")
 
 
+# --------------------------------------------------------------- status tab
+
+HEALTH_INTERVAL_S = 60
+HEALTH_TIMEOUT_S = 30
+HEALTH_FIRST_RUN_MS = 8000   # after launch, see run_health
+DEFAULT_DRS_DIR = "/Users/signlab/drs"
+
+HEALTH_COLORS = {
+    "ok":      QColor("#2e7d32"),
+    "warn":    QColor("#ef6c00"),
+    "fail":    QColor("#c62828"),
+    "unknown": QColor("#98a0aa"),
+}
+HEALTH_ROW_BG = {"warn": "#fff3e0", "fail": "#ffecec", "unknown": "#eeeeee"}
+HEALTH_RANK = {"ok": 0, "unknown": 0, "warn": 1, "fail": 2}
+
+
+class HealthError(Exception):
+    """The health program could not be run or gave no usable answer."""
+
+
+def health_command(cfg):
+    """The command that prints the studio health as JSON: config key
+    health_command (a list), else tools/health.py in drs_dir."""
+    cmd = cfg.get("health_command")
+    if isinstance(cmd, str):
+        return shlex.split(cmd)
+    if cmd:
+        return [str(c) for c in cmd]
+    drs_dir = cfg.get("drs_dir") or DEFAULT_DRS_DIR
+    return ["/usr/bin/python3", str(Path(drs_dir) / "tools" / "health.py"), "--json"]
+
+
+def _kill_health(proc):
+    """Kill the health program. Its own helpers (ps, df, find, curl) each
+    have a timeout, so they end by themselves."""
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def run_health(cmd, timeout=HEALTH_TIMEOUT_S, on_start=None):
+    """Run the health program and return its parsed JSON. Blocks for up to
+    `timeout` seconds, so call it off the UI thread. Every way this can go
+    wrong raises HealthError with a one-line reason for the Status tab."""
+    if not cmd:
+        raise HealthError("geen health_command ingesteld")
+    for arg in cmd[1:]:
+        if str(arg).endswith(".py") and not Path(arg).is_file():
+            raise HealthError(f"{Path(arg).name} niet gevonden in {Path(arg).parent}")
+    try:
+        # close_fds=False and no new session: Python then starts the program
+        # with posix_spawn instead of fork. fork() from a thread takes the
+        # system's fork locks, and while AppKit is still launching the app on
+        # the main thread the two deadlock: the window never opens.
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, encoding="utf-8",
+            errors="replace", close_fds=False)
+    except FileNotFoundError:
+        raise HealthError(f"{cmd[0]} niet gevonden")
+    except OSError as e:
+        raise HealthError(str(e))
+    if on_start:
+        on_start(proc)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_health(proc)
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        raise HealthError(f"geen antwoord binnen {timeout:g} s")
+    if proc.returncode != 0:
+        lines = (err or "").strip().splitlines()
+        reason = f"afgesloten met code {proc.returncode}"
+        raise HealthError(f"{reason}: {lines[-1][:200]}" if lines else reason)
+    try:
+        data = json.loads(out)
+    except ValueError:
+        raise HealthError("ongeldige JSON in het antwoord")
+    if not isinstance(data, dict) or not isinstance(data.get("checks"), list):
+        raise HealthError("onverwacht antwoord (geen lijst 'checks')")
+    return data
+
+
+class HealthThread(QThread):
+    """Runs the health program off the UI thread: once at start, then every
+    interval, and straight away when refresh() is called."""
+    run_started = pyqtSignal()
+    result = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, cmd, interval_s=HEALTH_INTERVAL_S, timeout_s=HEALTH_TIMEOUT_S):
+        super().__init__()
+        self.cmd = cmd
+        self.interval_s = interval_s
+        self.timeout_s = timeout_s
+        self._running = True
+        self._wake = threading.Event()
+        self._proc = None
+
+    def _remember(self, proc):
+        self._proc = proc
+
+    def run(self):
+        while self._running:
+            self._wake.clear()
+            self.run_started.emit()
+            data = error = None
+            try:
+                data = run_health(self.cmd, self.timeout_s, self._remember)
+            except Exception as e:
+                error = str(e) or e.__class__.__name__
+            self._proc = None
+            if not self._running:
+                break
+            if error is None:
+                self.result.emit(data)
+            else:
+                self.failed.emit(error)
+            self._wake.wait(self.interval_s)
+
+    def refresh(self):
+        self._wake.set()
+
+    def stop(self):
+        self._running = False
+        self._wake.set()
+        proc = self._proc
+        if proc is not None:
+            _kill_health(proc)
+
+
+def status_font(size, bold=False):
+    """The system UI font for the Status tab, with digits of equal width so
+    times and counts line up and do not look uneven (SF's default digits are
+    proportional). QFont("") leaves the family to a fallback lookup."""
+    font = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont)
+    font.setPointSize(size)
+    font.setWeight(QFont.Weight.Bold if bold else QFont.Weight.Normal)
+    try:
+        font.setFeature(QFont.Tag("tnum"), 1)
+    except (AttributeError, TypeError):   # Qt older than 6.7
+        pass
+    return font
+
+
+def status_dot(color, size):
+    """A filled circle in the given colour, for the rows and the tab."""
+    pm = QPixmap(size * 2, size * 2)
+    pm.setDevicePixelRatio(2)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(color)
+    p.drawEllipse(QPointF(size / 2, size / 2), size / 2 - 1, size / 2 - 1)
+    p.end()
+    return pm
+
+
+def open_help_url(url):
+    """Open a help page in the default browser (web links only)."""
+    if str(url).startswith(("http://", "https://")):
+        QDesktopServices.openUrl(QUrl(url))
+
+
+class HealthRow(QFrame):
+    """One studio part: coloured dot, title and detail; when it is not ok also
+    what to do about it and a Hulp button."""
+
+    # explicit colours: the row is tinted, so it must not follow dark mode
+    HELP_BTN_STYLE = ("QPushButton { background-color: white; color: #222; "
+                      "font-weight: bold; font-size: 14px; padding: 6px 18px; "
+                      "border-radius: 6px; border: 1px solid #98a0aa; } "
+                      "QPushButton:hover { background-color: #eee; }")
+
+    def __init__(self, check):
+        super().__init__()
+        status = check.get("status")
+        self.status = status if status in HEALTH_COLORS else "unknown"
+        self.help_url = str(check.get("help_url") or "")
+        self.setObjectName("healthRow")
+        bg = HEALTH_ROW_BG.get(self.status)
+        self.setStyleSheet(
+            "QFrame#healthRow { border: 1px solid #c3c9d2; border-radius: 6px; "
+            + (f"background-color: {bg}; }} QLabel {{ color: #2b2f36; }}" if bg else "}"))
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 6, 14, 6)
+        layout.setSpacing(14)
+
+        self.dot = QLabel()
+        self.dot.setPixmap(status_dot(HEALTH_COLORS[self.status], 26))
+        layout.addWidget(self.dot, 0, Qt.AlignmentFlag.AlignTop)
+
+        text = QVBoxLayout()
+        text.setSpacing(0)
+        self.title_label = QLabel(str(check.get("title") or check.get("id") or "?"))
+        self.title_label.setFont(status_font(15, bold=True))
+        self.detail_label = QLabel(str(check.get("detail") or ""))
+        self.detail_label.setFont(status_font(13))
+        labels = [self.title_label, self.detail_label]
+        action = str(check.get("action") or "")
+        self.action_label = None
+        if self.status != "ok" and action:
+            self.action_label = QLabel(f"→ {action}")
+            self.action_label.setFont(status_font(13, bold=True))
+            labels.append(self.action_label)
+        for label in labels:
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setWordWrap(True)
+            text.addWidget(label)
+        self.detail_label.setVisible(bool(self.detail_label.text()))
+        layout.addLayout(text, 1)
+
+        self.help_button = None
+        if self.status != "ok" and self.help_url.startswith(("http://", "https://")):
+            self.help_button = QPushButton("Hulp")
+            self.help_button.setStyleSheet(self.HELP_BTN_STYLE)
+            self.help_button.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.help_button.setToolTip(self.help_url)
+            self.help_button.clicked.connect(lambda: open_help_url(self.help_url))
+            layout.addWidget(self.help_button, 0, Qt.AlignmentFlag.AlignVCenter)
+
+
+class StatusTab(QWidget):
+    """The Status tab: one light per studio part, as reported by the health
+    program (tools/health.py in drs-pipeline). The checks themselves are not in
+    this app; this only runs the program and draws its answer."""
+
+    # ok / warn / fail, "error" (check could not run) or "pending" (no answer yet)
+    overall_changed = pyqtSignal(str)
+
+    TAB_TEXT = "Status"
+    TAB_COLORS = {"ok": "ok", "warn": "warn", "fail": "fail",
+                  "error": "warn", "pending": "unknown"}
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.health_thread = None
+        self.last_result = None
+        self.last_good_time = None
+        self.qr_open = None        # set by the main window; None = not known
+        self.overall = "pending"
+        self.rows = []
+        self._tabs = None
+
+        root = QVBoxLayout(self)
+        head = QHBoxLayout()
+        head.setSpacing(12)
+        self.overall_dot = QLabel()
+        self.summary_label = QLabel("Status wordt gecontroleerd…")
+        self.summary_label.setFont(status_font(20, bold=True))
+        self.checked_label = QLabel("")
+        self.checked_label.setFont(status_font(13))
+        self.checked_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.btn_refresh = QPushButton("↻ Vernieuwen")
+        self.btn_refresh.clicked.connect(self.refresh)
+        head.addWidget(self.overall_dot)
+        head.addWidget(self.summary_label)
+        head.addStretch()
+        head.addWidget(self.checked_label)
+        head.addWidget(self.btn_refresh)
+        root.addLayout(head)
+
+        # rows scroll, so a long list never forces the window to grow
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        holder = QWidget()
+        self.rows_layout = QVBoxLayout(holder)
+        self.rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.rows_layout.setSpacing(6)
+        self.rows_layout.addStretch()
+        self.scroll.setWidget(holder)
+        root.addWidget(self.scroll, 1)
+        self._set_overall("pending")
+
+    # ------------------------------------------------------------- tab
+
+    def add_to_tabs(self, tabs):
+        """Add this page to the tab widget and keep its tab showing the overall
+        status, so trouble is noticed from the other tab."""
+        self._tabs = tabs
+        tabs.addTab(self, self.TAB_TEXT)
+        self._update_tab()
+
+    def _update_tab(self):
+        if self._tabs is None:
+            return
+        index = self._tabs.indexOf(self)
+        if index < 0:
+            return
+        color = HEALTH_COLORS[self.TAB_COLORS[self.overall]]
+        attention = self.overall in ("warn", "fail", "error")
+        self._tabs.setTabIcon(index, QIcon(status_dot(color, 14)))
+        self._tabs.setTabText(index, self.TAB_TEXT + (" ⚠" if attention else ""))
+        self._tabs.tabBar().setTabTextColor(index, color if attention else QColor())
+        self._tabs.setTabToolTip(index, self.summary_label.text())
+
+    # ---------------------------------------------------------- runner
+
+    def start_checks(self, cmd, interval_s=HEALTH_INTERVAL_S, timeout_s=HEALTH_TIMEOUT_S):
+        """Run the health program now and then every interval, off the UI thread."""
+        self.stop_checks()
+        self.health_thread = HealthThread(cmd, interval_s, timeout_s)
+        self.health_thread.run_started.connect(lambda: self.set_running(True))
+        self.health_thread.result.connect(self.show_result)
+        self.health_thread.failed.connect(self.show_error)
+        self.health_thread.start()
+
+    def stop_checks(self):
+        if self.health_thread is not None:
+            self.health_thread.stop()
+            self.health_thread.wait(8000)
+            self.health_thread = None
+
+    def refresh(self):
+        if self.health_thread is not None and self.btn_refresh.isEnabled():
+            self.set_running(True)
+            self.health_thread.refresh()
+
+    def set_running(self, running):
+        self.btn_refresh.setEnabled(not running)
+        self.btn_refresh.setText("Bezig…" if running else "↻ Vernieuwen")
+
+    # ---------------------------------------------------------- drawing
+
+    def show_result(self, data):
+        self.set_running(False)
+        self.last_result = data
+        self.last_good_time = datetime.now()
+        host = str(data.get("host") or "")
+        self.checked_label.setText(f"Laatst gecontroleerd {self.last_good_time:%H:%M:%S}")
+        self.checked_label.setToolTip(host)
+        self._render()
+
+    def show_error(self, reason):
+        self.set_running(False)
+        self.last_result = None
+        if self.last_good_time:
+            last = f"Laatste geslaagde controle: {self.last_good_time:%H:%M:%S}"
+        else:
+            last = "Nog geen geslaagde controle"
+        self.checked_label.setText(last)
+        self.summary_label.setText("Statuscontrole mislukt")
+        self._set_rows([{"status": "unknown",
+                         "title": "Statuscontrole kon niet worden uitgevoerd",
+                         "detail": str(reason), "action": last}])
+        self._set_overall("error")
+
+    def set_qr_open(self, is_open):
+        """Only this app knows whether the QR page is open; the health program
+        reports it as unknown and the row is filled in from here."""
+        if is_open == self.qr_open:
+            return
+        self.qr_open = is_open
+        if self.last_result is not None:
+            self._render()
+
+    def _checks(self):
+        """The reported checks, with qr_screen filled in from the app's own
+        knowledge when the health program could not tell. Returns the list and
+        whether a row was changed."""
+        checks, changed = [], False
+        for c in self.last_result.get("checks", []):
+            if not isinstance(c, dict):
+                continue
+            if (c.get("id") == "qr_screen" and c.get("status") not in ("ok", "warn", "fail")
+                    and self.qr_open is not None):
+                c = dict(c)
+                if self.qr_open:
+                    c.update(status="ok", detail="open", action="")
+                else:
+                    c.update(status="fail", detail="niet open",
+                             action="Klik op 'QR-scherm openen'")
+                changed = True
+            checks.append(c)
+        return checks, changed
+
+    def _render(self):
+        checks, changed = self._checks()
+        self._set_rows(checks)
+        worst = max((HEALTH_RANK[r.status] for r in self.rows), default=0)
+        overall = self.last_result.get("overall")
+        if changed or overall not in ("ok", "warn", "fail"):
+            overall = ["ok", "warn", "fail"][worst]
+        fails = sum(1 for r in self.rows if r.status == "fail")
+        warns = sum(1 for r in self.rows if r.status == "warn")
+        parts = []
+        if fails:
+            parts.append(f"{fails} {'probleem' if fails == 1 else 'problemen'}")
+        if warns:
+            parts.append(f"{warns} {'waarschuwing' if warns == 1 else 'waarschuwingen'}")
+        if overall == "ok":
+            self.summary_label.setText("Alles in orde")
+        else:
+            self.summary_label.setText(" · ".join(parts) or "Let op")
+        self._set_overall(overall)
+
+    def _set_rows(self, checks):
+        for row in self.rows:
+            self.rows_layout.removeWidget(row)
+            row.setParent(None)
+            row.deleteLater()
+        self.rows = [HealthRow(c) for c in checks]
+        for i, row in enumerate(self.rows):
+            self.rows_layout.insertWidget(i, row)
+
+    def _set_overall(self, overall):
+        changed = overall != self.overall
+        self.overall = overall
+        color = HEALTH_COLORS[self.TAB_COLORS[overall]]
+        self.overall_dot.setPixmap(status_dot(color, 30))
+        self.summary_label.setStyleSheet(
+            f"color: {color.name()};" if overall != "pending" else "")
+        self._update_tab()
+        if changed:
+            self.overall_changed.emit(overall)
+
+
 # --------------------------------------------------------------- main window
 
 class MainWindow(QMainWindow):
@@ -759,6 +1187,11 @@ class MainWindow(QMainWindow):
         self.display_status_timer.timeout.connect(self._update_display_status)
         self.display_status_timer.start(5000)
         self._update_display_status()
+
+        # Status tab: run the studio health program now and every minute
+        # Not during start-up: the first check waits until the window is up.
+        QTimer.singleShot(HEALTH_FIRST_RUN_MS,
+                          lambda: self.status_tab.start_checks(health_command(cfg)))
 
     # ---------------------------------------------------------------- UI
 
@@ -860,7 +1293,16 @@ class MainWindow(QMainWindow):
         bottom.addWidget(verify_box, 1)
 
         root.addLayout(bottom)
-        self.setCentralWidget(central)
+
+        # Tabs: everything above is the first tab, the studio status the second
+        self.status_tab = StatusTab()
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.addTab(central, "Camera's")
+        self.status_tab.add_to_tabs(self.tabs)
+        self.tabs.currentChanged.connect(
+            lambda _index: QTimer.singleShot(0, self._position_banner))
+        self.setCentralWidget(self.tabs)
         self.resize(1150, 760)
 
         # Big centered overlay box for camera-connection guidance, with its own
@@ -884,7 +1326,7 @@ class MainWindow(QMainWindow):
     def _position_banner(self):
         if not self.centralWidget():
             return
-        cw = self.centralWidget()
+        cw = self.banner.parentWidget()  # the camera tab's page
         w = int(cw.width() * 0.7)
         self.banner.setFixedWidth(w)
         h = max(self.banner.sizeHint().height(), 170)
@@ -1047,7 +1489,9 @@ class MainWindow(QMainWindow):
 
     def _update_display_status(self):
         """Refresh the QR-scherm indicator + button in the server bar."""
-        if self._kiosk_open():
+        kiosk_open = self._kiosk_open()
+        self.status_tab.set_qr_open(kiosk_open)
+        if kiosk_open:
             self.display_status_label.setText("QR-scherm: ● open")
             self.display_status_label.setStyleSheet("color: green;")
             self.btn_display.setEnabled(False)
@@ -1679,6 +2123,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.poller.stop()
         self.poller.wait(3000)
+        self.status_tab.stop_checks()
         if hasattr(self, "count_thread") and self.count_thread.isRunning():
             self.count_thread.stop()
             self.count_thread.wait(3000)
