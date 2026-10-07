@@ -22,7 +22,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import QPointF, QRect, QSize, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
-    QColor, QDesktopServices, QFont, QFontMetrics, QIcon, QPainter, QPen, QPixmap,
+    QColor, QDesktopServices, QFont, QFontDatabase, QFontMetrics, QIcon, QPainter, QPen, QPixmap,
 )
 from PyQt6.QtWidgets import (
     QApplication, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
@@ -829,6 +829,20 @@ class HealthThread(QThread):
             _kill_health(proc)
 
 
+def status_font(size, bold=False):
+    """The system UI font for the Status tab, with digits of equal width so
+    times and counts line up and do not look uneven (SF's default digits are
+    proportional). QFont("") leaves the family to a fallback lookup."""
+    font = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont)
+    font.setPointSize(size)
+    font.setWeight(QFont.Weight.Bold if bold else QFont.Weight.Normal)
+    try:
+        font.setFeature(QFont.Tag("tnum"), 1)
+    except (AttributeError, TypeError):   # Qt older than 6.7
+        pass
+    return font
+
+
 def status_dot(color, size):
     """A filled circle in the given colour, for the rows and the tab."""
     pm = QPixmap(size * 2, size * 2)
@@ -880,15 +894,15 @@ class HealthRow(QFrame):
         text = QVBoxLayout()
         text.setSpacing(0)
         self.title_label = QLabel(str(check.get("title") or check.get("id") or "?"))
-        self.title_label.setFont(QFont("", 15, QFont.Weight.Bold))
+        self.title_label.setFont(status_font(15, bold=True))
         self.detail_label = QLabel(str(check.get("detail") or ""))
-        self.detail_label.setFont(QFont("", 13))
+        self.detail_label.setFont(status_font(13))
         labels = [self.title_label, self.detail_label]
         action = str(check.get("action") or "")
         self.action_label = None
         if self.status != "ok" and action:
             self.action_label = QLabel(f"→ {action}")
-            self.action_label.setFont(QFont("", 13, QFont.Weight.Bold))
+            self.action_label.setFont(status_font(13, bold=True))
             labels.append(self.action_label)
         for label in labels:
             label.setTextFormat(Qt.TextFormat.PlainText)
@@ -934,9 +948,10 @@ class StatusTab(QWidget):
         head.setSpacing(12)
         self.overall_dot = QLabel()
         self.summary_label = QLabel("Status wordt gecontroleerd…")
-        self.summary_label.setFont(QFont("", 20, QFont.Weight.Bold))
+        self.summary_label.setFont(status_font(20, bold=True))
         self.checked_label = QLabel("")
-        self.checked_label.setFont(QFont("", 12))
+        self.checked_label.setFont(status_font(13))
+        self.checked_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.btn_refresh = QPushButton("↻ Vernieuwen")
         self.btn_refresh.clicked.connect(self.refresh)
         head.addWidget(self.overall_dot)
@@ -1014,9 +1029,8 @@ class StatusTab(QWidget):
         self.last_result = data
         self.last_good_time = datetime.now()
         host = str(data.get("host") or "")
-        self.checked_label.setText(
-            (f"{host} · " if host else "")
-            + f"laatst gecontroleerd {self.last_good_time:%H:%M:%S}")
+        self.checked_label.setText(f"Laatst gecontroleerd {self.last_good_time:%H:%M:%S}")
+        self.checked_label.setToolTip(host)
         self._render()
 
     def show_error(self, reason):

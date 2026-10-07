@@ -100,8 +100,8 @@ def test_rows_for_every_status(app):
 
     assert tab.overall == "fail"
     assert tab.summary_label.text() == "1 probleem · 1 waarschuwing"
-    assert "signlabs-mini" in tab.checked_label.text()
-    assert "laatst gecontroleerd" in tab.checked_label.text()
+    assert tab.checked_label.text().startswith("Laatst gecontroleerd ")
+    assert tab.checked_label.toolTip() == "signlabs-mini"   # the host is a tooltip, not in the line
     assert tab.btn_refresh.isEnabled()
 
 
