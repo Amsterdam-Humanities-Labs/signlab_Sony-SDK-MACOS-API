@@ -44,6 +44,31 @@ Then open `http://localhost:8080`.
 
 There is no config file, no credentials and no authentication. Anyone who can reach the port can record, format the media or change the download path.
 
+## Controller app (`pyqtController/`)
+
+`fx30_controller.py` is the PyQt6 window the studio operators use. It starts `fx30MultiRecord`, shows the cameras, and syncs and verifies the clips. Copy `config.example.json` to `config.json` and start it with `./run.sh`.
+
+The **Status** tab shows one light per studio part (green, orange, red, or grey for unknown), a one-line detail and, when it is not green, what to do and a "Hulp" button that opens the help page. The checks are not in this app: it runs `tools/health.py --json` from drs-pipeline every 60 seconds (30 second timeout) and draws the answer. A dot on the tab shows the overall status from the camera tab. If the program is missing, fails, hangs or prints something else than JSON, the tab says why and the rest of the app carries on.
+
+Two optional keys in `config.json`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `drs_dir` | `/Users/signlab/drs` | Folder of drs-pipeline. The app runs `<drs_dir>/tools/health.py`. |
+| `health_command` | `["/usr/bin/python3", "<drs_dir>/tools/health.py", "--json"]` | The full command, as a list. Overrides `drs_dir`. |
+
+The command must exit 0 and print:
+
+```json
+{"generated_at": "2026-10-07T14:02:11+02:00", "host": "signlabs-mini", "overall": "ok|warn|fail",
+ "checks": [{"id": "research_drive", "title": "Research drive", "status": "ok|warn|fail|unknown",
+             "detail": "mounted, 1.0 TB free", "action": "", "help_url": "https://..."}]}
+```
+
+A `qr_screen` check with status `unknown` is filled in by the app, because only the app knows whether the QR page is open.
+
+Tests (no cameras needed): `QT_QPA_PLATFORM=offscreen python -m pytest pyqtController/test_status_tab.py`, in an environment with PyQt6 and pytest.
+
 ## REST API
 
 | Method | Path | What it does |
