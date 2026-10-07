@@ -387,3 +387,16 @@ def test_main_window_starts_with_the_status_tab(app, tmp_path, monkeypatch):
         pump(lambda: False, 0.1)
     assert win.status_tab.health_thread is None
     assert not win.poller.isRunning()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="posix_spawn path is checked on macOS")
+def test_run_health_does_not_fork(tmp_path, monkeypatch):
+    """fork() from a thread deadlocked the app at launch (the window never
+    opened); the health program must be started with posix_spawn."""
+    script = tmp_path / "health.py"
+    script.write_text('import json; print(json.dumps({"overall": "ok", "checks": []}))\n')
+
+    def no_fork(*a, **k):
+        raise AssertionError("run_health used fork instead of posix_spawn")
+    monkeypatch.setattr(fx.subprocess, "_fork_exec", no_fork)
+    assert fx.run_health([sys.executable, str(script)])["overall"] == "ok"

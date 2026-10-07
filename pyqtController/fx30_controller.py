@@ -700,6 +700,7 @@ class CameraCard(QFrame):
 
 HEALTH_INTERVAL_S = 60
 HEALTH_TIMEOUT_S = 30
+HEALTH_FIRST_RUN_MS = 8000   # after launch, see run_health
 DEFAULT_DRS_DIR = "/Users/signlab/drs"
 
 HEALTH_COLORS = {
@@ -729,14 +730,12 @@ def health_command(cfg):
 
 
 def _kill_health(proc):
-    """Kill the health program and anything it started (own process group)."""
+    """Kill the health program. Its own helpers (ps, df, find, curl) each
+    have a timeout, so they end by themselves."""
     try:
-        os.killpg(proc.pid, signal.SIGKILL)
+        proc.kill()
     except OSError:
-        try:
-            proc.kill()
-        except OSError:
-            pass
+        pass
 
 
 def run_health(cmd, timeout=HEALTH_TIMEOUT_S, on_start=None):
@@ -749,10 +748,14 @@ def run_health(cmd, timeout=HEALTH_TIMEOUT_S, on_start=None):
         if str(arg).endswith(".py") and not Path(arg).is_file():
             raise HealthError(f"{Path(arg).name} niet gevonden in {Path(arg).parent}")
     try:
+        # close_fds=False and no new session: Python then starts the program
+        # with posix_spawn instead of fork. fork() from a thread takes the
+        # system's fork locks, and while AppKit is still launching the app on
+        # the main thread the two deadlock: the window never opens.
         proc = subprocess.Popen(
             cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, encoding="utf-8",
-            errors="replace", start_new_session=True)
+            errors="replace", close_fds=False)
     except FileNotFoundError:
         raise HealthError(f"{cmd[0]} niet gevonden")
     except OSError as e:
@@ -1186,7 +1189,9 @@ class MainWindow(QMainWindow):
         self._update_display_status()
 
         # Status tab: run the studio health program now and every minute
-        self.status_tab.start_checks(health_command(cfg))
+        # Not during start-up: the first check waits until the window is up.
+        QTimer.singleShot(HEALTH_FIRST_RUN_MS,
+                          lambda: self.status_tab.start_checks(health_command(cfg)))
 
     # ---------------------------------------------------------------- UI
 
